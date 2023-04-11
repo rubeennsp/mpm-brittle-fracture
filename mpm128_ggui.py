@@ -2,9 +2,11 @@ import taichi as ti
 
 arch = ti.vulkan if ti._lib.core.with_vulkan() else ti.cuda
 ti.init(arch=arch)
+# ti.init(arch=ti.cuda)
 
 quality = 1  # Use a larger value for higher-res simulations
 n_particles, n_grid = 9000 * quality**2, 128 * quality
+# n_particles = 100
 dx, inv_dx = 1 / n_grid, float(n_grid)
 dt = 1e-4 / quality
 p_vol, p_rho = (dx * 0.5)**2, 1
@@ -41,45 +43,48 @@ def substep():
         grid_v[i, j] = [0, 0]
         grid_m[i, j] = 0
     for p in x:  # Particle state update and scatter to grid (P2G)
-        base = (x[p] * inv_dx - 0.5).cast(int)
+        # Base grid coords (integer)
+        base = ti.floor(x[p] * inv_dx - 0.5).cast(int)
+
+        # float offset from base grid coords # TODO: Find the range of this fx
         fx = x[p] * inv_dx - base.cast(float)
+        # print('Uncasted: ', (x[p] * inv_dx - 0.5), '\tbase = ', base, '\tfx = ', fx) 
+
         # Quadratic kernels  [http://mpm.graphics   Eqn. 123, with x=fx, fx-1,fx-2]
-        w = [0.5 * (1.5 - fx)**2, 0.75 - (fx - 1)**2, 0.5 * (fx - 0.5)**2]
+        w = [
+            0.5 * (1.5 - fx)**2, # N(fx  ).    fx     is between 0.5 and 1.5
+            0.75 - (fx - 1)**2,  # N(fx-1).    (fx-1) is between -0.5 and 0.5
+            0.5 * (fx - 0.5)**2  # N(fx-2).    (fx-2) is between -1.5 and 0.5
+        ]
+
         # deformation gradient update
-        F[p] = (ti.Matrix.identity(float, 2) + dt * C[p]) @ F[p]
-        # Hardening coefficient: snow gets harder when compressed
-        h = ti.max(0.1, ti.min(5, ti.exp(10 * (1.0 - Jp[p]))))
-        if material[p] == 1:  # jelly, make it softer
-            h = 0.3
-        mu, la = mu_0 * h, lambda_0 * h
-        if material[p] == 0:  # liquid
-            mu = 0.0
-        U, sig, V = ti.svd(F[p])
+        F[p] = (ti.Matrix.identity(float, 2) + dt * C[p]) @ F[p] # Multiply F by (I + dt * C)
+        # Hardening coefficient: Jelly
+        h = 1
+        mu, la = mu_0 * h, lambda_0 * h # TODO: What are these Lame parameters mu and lambda?
+
+        # Singular value decomposition
+        U, sig, V = ti.svd(F[p]) # TODO: Is this the right polar svd?
         J = 1.0
+
         for d in ti.static(range(2)):
-            new_sig = sig[d, d]
-            if material[p] == 2:  # Snow
-                new_sig = min(max(sig[d, d], 1 - 2.5e-2),
-                              1 + 4.5e-3)  # Plasticity
-            Jp[p] *= sig[d, d] / new_sig
-            sig[d, d] = new_sig
-            J *= new_sig
-        if material[p] == 0:
-            # Reset deformation gradient to avoid numerical instability
-            F[p] = ti.Matrix.identity(float, 2) * ti.sqrt(J)
-        elif material[p] == 2:
-            # Reconstruct elastic deformation gradient after plasticity
-            F[p] = U @ sig @ V.transpose()
-        stress = 2 * mu * (F[p] - U @ V.transpose()) @ F[p].transpose(
-        ) + ti.Matrix.identity(float, 2) * la * J * (J - 1)
-        stress = (-dt * p_vol * 4 * inv_dx * inv_dx) * stress
-        affine = stress + p_mass * C[p]
+            J *= sig[d, d]
+        # J is probably equal to determinant. TODO: Test this out
+
+        # Fixed corotated constitutive model seen in SIGGRAPH 2018 MPM Tutorial section 6.3.
+        # TODO: Change to Neo-Hookean from section 6.2? Change to other Neo-Hookean energies?
+        stress = (
+            2 * mu * (F[p] - U @ V.transpose()) @ F[p].transpose() # 2 mu (F-R) times F^T
+            + ti.Matrix.identity(float, 2) * la * J * (J - 1) # lambda J (J-1) F^-T times F^T
+        )
+        stress = (-dt * p_vol * 4 * inv_dx * inv_dx) * stress # TODO: What is this multiplier?
+        affine = stress + p_mass * C[p] # TODO: What is this affine thing? Looks different from our paper's. Connect it with the grid_v update below.
         # Loop over 3x3 grid node neighborhood
         for i, j in ti.static(ti.ndrange(3, 3)):
             offset = ti.Vector([i, j])
             dpos = (offset.cast(float) - fx) * dx
             weight = w[i][0] * w[j][1]
-            grid_v[base + offset] += weight * (p_mass * v[p] + affine @ dpos)
+            grid_v[base + offset] += weight * (p_mass * v[p] + affine @ dpos) # Momentum
             grid_m[base + offset] += weight * p_mass
     for i, j in grid_m:
         if grid_m[i, j] > 0:  # No need for epsilon here
@@ -117,10 +122,14 @@ def substep():
 
 @ti.kernel
 def reset():
+    # i: [0, ..., n-1]
+    # group_size = n / 3
+    # (i // group_size): [0, 0, ..., 0, 1, 1, ..., 1, 2, 2, ..., 2] == material
+    start_pos = ti.Vector([0.3, 0.05])
     for i in range(n_particles):
         x[i] = [
-            ti.random() * 0.2 + 0.3 + 0.10 * (i // group_size),
-            ti.random() * 0.2 + 0.05 + 0.32 * (i // group_size)
+            ti.random() * 0.2 + start_pos[0] + 0.10 * (i // group_size),
+            ti.random() * 0.2 + start_pos[1] + 0.32 * (i // group_size)
         ]
         material[i] = i // group_size  # 0: fluid 1: jelly 2: snow
         v[i] = [0, 0]
@@ -178,6 +187,7 @@ def main():
 
         for s in range(int(2e-3 // dt)):
             substep()
+            # quit()
         render()
         canvas.set_background_color((0.067, 0.184, 0.255))
         canvas.circles(water, radius=radius, color=(0, 0.5, 0.5))
