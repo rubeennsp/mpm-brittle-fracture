@@ -73,19 +73,41 @@ def substep():
 
         # Fixed corotated constitutive model seen in SIGGRAPH 2018 MPM Tutorial section 6.3.
         # TODO: Change to Neo-Hookean from section 6.2? Change to other Neo-Hookean energies?
-        stress = (
+        stress_J = (
             2 * mu * (F[p] - U @ V.transpose()) @ F[p].transpose() # 2 mu (F-R) times F^T
             + ti.Matrix.identity(float, 2) * la * J * (J - 1) # lambda J (J-1) F^-T times F^T
         )
-        stress = (-dt * p_vol * 4 * inv_dx * inv_dx) * stress # TODO: What is this multiplier?
-        affine = stress + p_mass * C[p] # TODO: What is this affine thing? Looks different from our paper's. Connect it with the grid_v update below.
-        # Loop over 3x3 grid node neighborhood
+
+        # FLOP optimization from the starter code. Refer to Q_p in section 6 equation (29) of the MLS-MPM paper.
+        # stress_J = (-dt * p_vol * 4 * inv_dx * inv_dx) * stress_J
+        # affine = stress_J + p_mass * C[p] # Q_p
+        # # Later, in the gridnode loop, we get
+        # # mv_contribution = (p_mass * v[p] + affine @ dpos)
+        # # which saves at least one matmul
+        # # But we're not using this. For clarity.
+
+        # (unweighted contribution of) internal force * dt
+        M_inv = (4 * inv_dx * inv_dx) # 4 / h^2
+        fint_dt = - dt * p_vol * M_inv * stress_J # to be multiplied by weight and dpos, later. In other words,
+                                                  # internal force * dt = fint_dt @ (xi - xp)
+
+        # Loop over 3x3 grid node neighborhood around particle.
         for i, j in ti.static(ti.ndrange(3, 3)):
+            # Compute delta x from particle to grid. (xi - xp)
             offset = ti.Vector([i, j])
             dpos = (offset.cast(float) - fx) * dx
-            weight = w[i][0] * w[j][1]
-            grid_v[base + offset] += weight * (p_mass * v[p] + affine @ dpos) # Momentum
+
+            # Compute particle's momentum contribution to grid node
+            mv_contribution = v[p]              # start with linear velocity
+            mv_contribution += C[p] @ dpos      # include affine velocity
+            mv_contribution *= p_mass           # momentum = mass * velocity
+            mv_contribution += fint_dt @ dpos   # include internal force * dt
+
+            # Accumulate weighted contribution on gridnode.
+            weight = w[i][0] * w[j][1] # quadratic kernel weight product over dimensions
+            grid_v[base + offset] += weight * mv_contribution
             grid_m[base + offset] += weight * p_mass
+
     for i, j in grid_m:
         if grid_m[i, j] > 0:  # No need for epsilon here
             grid_v[i,
