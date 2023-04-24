@@ -1,8 +1,9 @@
 import taichi as ti
+import matplotlib.cm
 
 arch = ti.vulkan if ti._lib.core.with_vulkan() else ti.cuda
-ti.init(arch=arch)
-# ti.init(arch=ti.cuda)
+# ti.init(arch=arch)
+ti.init(arch=ti.cuda)
 
 quality = 1  # Use a larger value for higher-res simulations
 n_particles, n_grid = 9000 * quality**2, 128 * quality
@@ -12,6 +13,11 @@ dt = 1e-4 / quality
 p_vol, p_rho = (dx * 0.5)**2, 1
 p_mass = p_vol * p_rho
 E, nu = 5e3, 0.2  # Young's modulus and Poisson's ratio
+H = 3.  # Brittleness factor. TODO: Use more primitive params to determine this constant.
+        #                           (Young's modulus, principal failure, etc.)
+        #                           See Section 4.2 of paper, under eq (7), for definition.
+        #                           See Table 3 for actual parameter values.
+sigma_f = 200. # principal failure stress. See Section 4.2 of paper.
 mu_0, lambda_0 = E / (2 * (1 + nu)), E * nu / (
     (1 + nu) * (1 - 2 * nu))  # Lame parameters
 
@@ -22,7 +28,7 @@ C = ti.Matrix.field(2, 2, dtype=float,
 F = ti.Matrix.field(2, 2, dtype=float,
                     shape=n_particles)  # deformation gradient
 material = ti.field(dtype=int, shape=n_particles)  # material id
-Jp = ti.field(dtype=float, shape=n_particles)  # plastic deformation
+damage = ti.field(dtype=float, shape=n_particles)  # material damage (c in equations)
 grid_v = ti.Vector.field(2, dtype=float,
                          shape=(n_grid, n_grid))  # grid node momentum/velocity
 grid_m = ti.field(dtype=float, shape=(n_grid, n_grid))  # grid node mass
@@ -31,11 +37,9 @@ attractor_strength = ti.field(dtype=float, shape=())
 attractor_pos = ti.Vector.field(2, dtype=float, shape=())
 
 group_size = n_particles // 3
-water = ti.Vector.field(2, dtype=float, shape=group_size)  # position
-jelly = ti.Vector.field(2, dtype=float, shape=group_size)  # position
-snow = ti.Vector.field(2, dtype=float, shape=group_size)  # position
+color = ti.Vector.field(3, dtype=float, shape=n_particles)
 mouse_circle = ti.Vector.field(2, dtype=float, shape=(1, ))
-
+colormap = matplotlib.cm.get_cmap('jet')
 
 @ti.kernel
 def substep():
@@ -71,12 +75,51 @@ def substep():
             J *= sig[d, d]
         # J is probably equal to determinant. TODO: Test this out
 
+        # J = ti.Matrix.determinant(F[p])
+
         # Fixed corotated constitutive model seen in SIGGRAPH 2018 MPM Tutorial section 6.3.
         # TODO: Change to Neo-Hookean from section 6.2? Change to other Neo-Hookean energies?
-        stress_J = (
-            2 * mu * (F[p] - U @ V.transpose()) @ F[p].transpose() # 2 mu (F-R) times F^T
-            + ti.Matrix.identity(float, 2) * la * J * (J - 1) # lambda J (J-1) F^-T times F^T
+        effective_stress = (
+            2 * mu / J * (F[p] - U @ V.transpose()) @ F[p].transpose() # 2 mu (F-R) times F^T
+            + ti.Matrix.identity(float, 2) * la * (J - 1) # lambda J (J-1) F^-T times F^T
         )
+
+        # Force the symmetry. It should be pretty close to symmetric, but err on safety.
+        effective_stress = (effective_stress + effective_stress.transpose()) / 2.
+
+        # symmetry check: should print a matrix of zeros
+        # if p == 100: print(effective_stress - effective_stress.transpose())
+
+        # (Symmetric) Eigendecomposition: effective_stress == Q @ diag(sigbar) @ Q.transpose()
+        sigbar, Q = ti.sym_eig(effective_stress) # Q's rows are normalized eigenvalues
+
+        # eigendecomposition check: should print a matrix of (near-)zeros
+        # if p == 100:
+        #     sigbarmat = ti.Matrix.zero(float, 2, 2)
+        #     for i in range(2):
+        #         sigbarmat[i, i] = sigbar[i]
+        #     effective_stress_recon = Q @ sigbarmat @ Q.transpose()
+
+        #     print(effective_stress_recon - effective_stress)
+
+        # Compute max, tensile, and compressive stresses.
+
+        max_effective_stress = ti.max(0, *sigbar) # scalar
+
+        # tensile_stress = ti.Matrix.zero(float, 2, 2)
+        # for i in ti.static(range(2)):
+        #     pass
+            # qi = Q[i, i]
+            # print(qi)
+            # tensile_stress += max(0, sigbar[i]) * qi.outer_product(qi)
+        # compressive_stress = effective_stress - tensile_stress
+
+        # Update damage from max stress
+        unclamped_damage = (1 + H) * (1 - sigma_f / max_effective_stress)
+        clamped_damage = ti.math.clamp(unclamped_damage, 0, 1) # Clamp damage between 0 and 1
+        damage[p] = ti.max(damage[p], clamped_damage)
+
+        stress_J = effective_stress * J
 
         # FLOP optimization from the starter code. Refer to Q_p in section 6 equation (29) of the MLS-MPM paper.
         # stress_J = (-dt * p_vol * 4 * inv_dx * inv_dx) * stress_J
@@ -156,16 +199,8 @@ def reset():
         material[i] = i // group_size  # 0: fluid 1: jelly 2: snow
         v[i] = [0, 0]
         F[i] = ti.Matrix([[1, 0], [0, 1]])
-        Jp[i] = 1
+        damage[i] = 0
         C[i] = ti.Matrix.zero(float, 2, 2)
-
-
-@ti.kernel
-def render():
-    for i in range(group_size):
-        water[i] = x[i]
-        jelly[i] = x[i + group_size]
-        snow[i] = x[i + 2 * group_size]
 
 
 def main():
@@ -210,11 +245,13 @@ def main():
         for s in range(int(2e-3 // dt)):
             substep()
             # quit()
-        render()
-        canvas.set_background_color((0.067, 0.184, 0.255))
-        canvas.circles(water, radius=radius, color=(0, 0.5, 0.5))
-        canvas.circles(jelly, radius=radius, color=(0.93, 0.33, 0.23))
-        canvas.circles(snow, radius=radius, color=(1, 1, 1))
+        
+        # Render
+        canvas.set_background_color((0, 0, 0))
+        color_numpy = colormap(damage.to_numpy(float))[:, :3]
+        color.from_numpy(color_numpy)
+        canvas.circles(x, radius=radius, per_vertex_color=color)
+
         window.show()
 
 
