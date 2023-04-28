@@ -293,7 +293,7 @@ def main():
     )
 
     res = (512, 512)
-    window = ti.ui.Window("Taichi MLS-MPM-128", res=res, vsync=True)
+    window = ti.ui.Window("Taichi MLS-MPM Brittle Fracture", res=res, vsync=True)
     canvas = window.get_canvas()
     radius = 0.003
 
