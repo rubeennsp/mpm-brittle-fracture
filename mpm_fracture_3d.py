@@ -1,19 +1,27 @@
+import taichi as ti
+from taichi_glsl.scalar import isnan, isinf
+import matplotlib.cm
+from math import sqrt
 import numpy as np
 
 import taichi as ti
 
 arch = ti.vulkan if ti._lib.core.with_vulkan() else ti.cuda
 ti.init(arch=arch)
+# ti.init(arch=ti.cuda)
+# ti.init(arch=ti.cuda, debug=True)
+# ti.init(arch=ti.cpu, debug=False)
 
 #dim, n_grid, steps, dt = 2, 128, 20, 2e-4
 #dim, n_grid, steps, dt = 2, 256, 32, 1e-4
 #dim, n_grid, steps, dt = 3, 32, 25, 4e-4
-dim, n_grid, steps, dt = 3, 64, 25, 2e-4
+dim, n_grid, steps, dt = 3, 64, 25, 2e-4 / 4
+# dim, n_grid, steps, dt = 3, 96, 1, 2e-4 / 10
 #dim, n_grid, steps, dt = 3, 128, 5, 1e-4
 
 n_particles = n_grid**dim // 2**(dim - 1)
 
-print(n_particles)
+print(f'n_particles: {n_particles}')
 
 dx = 1 / n_grid
 
@@ -22,15 +30,25 @@ p_vol = (dx * 0.5)**2
 p_mass = p_vol * p_rho
 GRAVITY = [0, -9.8, 0]
 bound = 3
-E = 1000  # Young's modulus
+E = 5e4  # Young's modulus
 nu = 0.2  #  Poisson's ratio
+Gf = 200 # Mode 1 fracture energy
+sigma_f = 150 # principal failure stress. See Section 4.2 of paper.
+l_ch = dx * sqrt(dim) # Characteristic length: grid-cell diagonal
+H_bar = sigma_f ** 2 / (2 * E * Gf)
+H = H_bar * l_ch / (1 - H_bar * l_ch)  # Brittleness factor.   See Section 4.2 of paper, under eq (7), for definition.
+                                       #                       See Table 3 for actual parameter values.
+H = 40 # override "properly-calculated" brittleness factor :( because it didn't work very well.
+       # TODO: Investigate these parameter settings. They might be scale dependent.
+print(f'H: {H}')
 mu_0, lambda_0 = E / (2 * (1 + nu)), E * nu / (
     (1 + nu) * (1 - 2 * nu))  # Lame parameters
 
 F_x = ti.Vector.field(dim, float, n_particles)
 F_v = ti.Vector.field(dim, float, n_particles)
+F_damage = ti.field(dtype=float, shape=n_particles)  # material damage (c in equations)
 F_C = ti.Matrix.field(dim, dim, float, n_particles)
-F_dg = ti.Matrix.field(3, 3, dtype=float,
+F_dg = ti.Matrix.field(dim, dim, dtype=float,
                        shape=n_particles)  # deformation gradient
 F_Jp = ti.field(float, n_particles)
 
@@ -40,12 +58,35 @@ F_materials = ti.field(int, n_particles)
 F_grid_v = ti.Vector.field(dim, float, (n_grid, ) * dim)
 F_grid_m = ti.field(float, (n_grid, ) * dim)
 F_used = ti.field(int, n_particles)
+colormap = matplotlib.cm.get_cmap('jet') # Can try other colormaps
 
 neighbour = (3, ) * dim
 
 WATER = 0
 JELLY = 1
 SNOW = 2
+
+@ti.func
+def my_sym_eig_3x3(A):
+    Q, sig_mat, Q2 = ti.svd(A)
+    eig = ti.Vector.zero(dt=float, n=3)
+    for j in ti.static(range(3)):
+        mult = 1.0
+        if sig_mat[j, j] == 0.0:
+            mult = 1.0
+        else:
+            divresult = (A @ Q[:, j]) / (sig_mat[j, j] * Q[:, j])
+            print(f"divresult {j}: {divresult}")
+            for i in ti.static(range(3)):
+                if ti.abs(ti.abs(divresult[i]) - 1) < 1e-5:
+                    mult = divresult[i]
+
+        eig[j] = sig_mat[j, j] * mult
+        # Q[:, j] = Q[:, j] * mult
+
+    print(eig, 'eig')
+    print(Q, 'Q')
+    return eig, Q
 
 
 @ti.kernel
@@ -62,46 +103,65 @@ def substep(g_x: float, g_y: float, g_z: float):
         fx = Xp - base
         w = [0.5 * (1.5 - fx)**2, 0.75 - (fx - 1)**2, 0.5 * (fx - 0.5)**2]
 
-        F_dg[p] = (ti.Matrix.identity(float, 3) +
+        F_dg[p] = (ti.Matrix.identity(float, dim) +
                    dt * F_C[p]) @ F_dg[p]  # deformation gradient update
-        # Hardening coefficient: snow gets harder when compressed
-        h = ti.exp(10 * (1.0 - F_Jp[p]))
-        if F_materials[p] == JELLY:  # jelly, make it softer
-            h = 0.3
+
+        # Hardening coefficient (snow gets harder when compressed. We don't need snow in our sim)
+        h = 1
         mu, la = mu_0 * h, lambda_0 * h
-        if F_materials[p] == WATER:  # liquid
-            mu = 0.0
 
         U, sig, V = ti.svd(F_dg[p])
-        J = 1.0
-        for d in ti.static(range(3)):
-            new_sig = sig[d, d]
-            if F_materials[p] == SNOW:  # Snow
-                new_sig = ti.min(ti.max(sig[d, d], 1 - 2.5e-2),
-                                 1 + 4.5e-3)  # Plasticity
-            F_Jp[p] *= sig[d, d] / new_sig
-            sig[d, d] = new_sig
-            J *= new_sig
-        if F_materials[p] == WATER:
-            # Reset deformation gradient to avoid numerical instability
-            new_F = ti.Matrix.identity(float, 3)
-            new_F[0, 0] = J
-            F_dg[p] = new_F
-        elif F_materials[p] == SNOW:
-            # Reconstruct elastic deformation gradient after plasticity
-            F_dg[p] = U @ sig @ V.transpose()
-        stress = 2 * mu * (F_dg[p] - U @ V.transpose()) @ F_dg[p].transpose(
-        ) + ti.Matrix.identity(float, 3) * la * J * (J - 1)
-        stress = (-dt * p_vol * 4) * stress / dx**2
-        affine = stress + p_mass * F_C[p]
+        J = ti.Matrix.determinant(sig)
+
+        # Fixed corotated constitutive model seen in SIGGRAPH 2018 MPM Tutorial section 6.3.
+        # TODO: Change to Neo-Hookean from section 6.2? Change to other Neo-Hookean energies?
+        effective_stress = (
+            2 * mu / J * (F_dg[p] - U @ V.transpose()) @ F_dg[p].transpose() # 2 mu (F-R) times F^T
+            + ti.Matrix.identity(float, dim) * la * (J - 1) # lambda J (J-1) F^-T times F^T
+        )
+
+        # Force the symmetry. It should be pretty close to symmetric, but err on safety.
+        effective_stress = (effective_stress + effective_stress.transpose()) / 2.
+        assert not isnan(effective_stress[0, 0])
+        sigbar, Q = my_sym_eig_3x3(effective_stress) # Q's columns are normalized eigenvalues
+
+        max_effective_stress = ti.max(1e-5, *sigbar) # scalar
+
+        # Update damage from max stress
+        unclamped_damage = (1 + H) * (1 - sigma_f / max_effective_stress)
+        clamped_damage = ti.math.clamp(unclamped_damage, 0, 1) # Clamp damage between 0 and 1
+        c = F_damage[p] = ti.max(F_damage[p], clamped_damage)
+
+
+        weakened_sigbarmat = ti.Matrix.zero(float, dim, dim)
+        sigbarmat = ti.Matrix.zero(float, dim, dim)
+        for i in ti.static(range(dim)):
+            weakening_multiplier = (1 - c) if sigbar[i] > 0 else 1
+            weakened_sigbarmat[i, i] = sigbar[i] * weakening_multiplier
+            sigbarmat[i, i] = sigbar[i]
+        weakened_stress = Q @ weakened_sigbarmat @ Q.transpose()
+        # reconstructed_stress = Q @ sigbarmat @ Q.transpose()
+
+        stress_J = weakened_stress * J
+
+        M_inv = (4 / dx / dx) # 4 / h^2
+        fint_dt = - dt * p_vol * M_inv * stress_J # to be multiplied by weight and dpos, later. In other words,
+                                                  # internal force * dt = fint_dt @ (xi - xp)
 
         for offset in ti.static(ti.grouped(ti.ndrange(*neighbour))):
             dpos = (offset - fx) * dx
             weight = 1.0
             for i in ti.static(range(dim)):
                 weight *= w[offset[i]][i]
-            F_grid_v[base +
-                     offset] += weight * (p_mass * F_v[p] + affine @ dpos)
+
+            # Compute particle's momentum contribution to grid node
+            mv_contribution = F_v[p]            # start with linear velocity
+            mv_contribution += F_C[p] @ dpos    # include affine velocity
+            mv_contribution *= p_mass           # momentum = mass * velocity
+            mv_contribution += fint_dt @ dpos   # include internal force * dt
+
+            # F_grid_v[base + offset] += weight * (p_mass * F_v[p] + affine @ dpos)
+            F_grid_v[base + offset] += weight * mv_contribution
             F_grid_m[base + offset] += weight * p_mass
     for I in ti.grouped(F_grid_m):
         if F_grid_m[I] > 0:
@@ -150,7 +210,8 @@ def init_cube_vol(first_par: int, last_par: int, x_begin: float,
             [x_size, y_size, z_size]) + ti.Vector([x_begin, y_begin, z_begin])
         F_Jp[i] = 1
         F_dg[i] = ti.Matrix([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
-        F_v[i] = ti.Vector([0.0, 0.0, 0.0])
+        F_v[i] = ti.Vector([0.0, -2.0, 0.0])
+        F_damage[i] = 0
         F_materials[i] = material
         F_colors_random[i] = ti.Vector(
             [ti.random(), ti.random(),
@@ -231,7 +292,7 @@ curr_preset_id = 0
 paused = False
 
 use_random_colors = False
-particles_radius = 0.02
+particles_radius = 0.002
 
 material_colors = [(0.1, 0.6, 0.9), (0.93, 0.33, 0.23), (1.0, 1.0, 1.0)]
 
@@ -286,7 +347,7 @@ def show_options():
                                                     material_colors[JELLY])
             set_color_by_material(np.array(material_colors, dtype=np.float32))
         particles_radius = w.slider_float("particles radius ",
-                                          particles_radius, 0, 0.1)
+                                          particles_radius, 0, 0.005)
         if w.button("restart"):
             init()
         if paused:
@@ -296,6 +357,8 @@ def show_options():
             if w.button("Pause"):
                 paused = True
 
+def lerp(a, b, t):
+    return a * (1 - t) + b * t
 
 def render():
     camera.track_user_inputs(window, movement_speed=0.03, hold_key=ti.ui.RMB)
@@ -303,6 +366,12 @@ def render():
 
     scene.ambient_light((0, 0, 0))
 
+    damage_numpy = F_damage.to_numpy(float)
+    # damage_numpy[damage_numpy < 1] = 0 # Ignore partial damage. Only fully damaged particles are colored.
+    alpha = lerp(1, 0.1, damage_numpy)
+    color_numpy = colormap(damage_numpy)
+    color_numpy[:, 3] = alpha
+    F_colors.from_numpy(color_numpy)
     colors_used = F_colors_random if use_random_colors else F_colors
     scene.particles(F_x, per_vertex_color=colors_used, radius=particles_radius)
 
