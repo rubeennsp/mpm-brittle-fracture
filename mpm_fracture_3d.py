@@ -78,14 +78,13 @@ def my_sym_eig_3x3(A):
             divresult = (A @ Q[:, j]) / (sig_mat[j, j] * Q[:, j])
             print(f"divresult {j}: {divresult}")
             for i in ti.static(range(3)):
+                # Guard for inf or nan
+                # or really for anything other than +/- 1
                 if ti.abs(ti.abs(divresult[i]) - 1) < 1e-5:
                     mult = divresult[i]
 
         eig[j] = sig_mat[j, j] * mult
-        # Q[:, j] = Q[:, j] * mult
 
-    print(eig, 'eig')
-    print(Q, 'Q')
     return eig, Q
 
 
