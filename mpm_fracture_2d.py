@@ -9,23 +9,25 @@ ti.init(arch=arch)
 # ti.init(arch=ti.cuda, debug=True)
 # ti.init(arch=ti.cpu, debug=False)
 
-quality = 3  # Use a larger value for higher-res simulations
+quality = 1  # Use a larger value for higher-res simulations
 n_particles, n_grid = 9000 * quality**2, 64 * quality
 # n_particles = 100
 dx, inv_dx = 1 / n_grid, float(n_grid)
-dt = 1e-4 / quality / 60
-frame_duration = 2e-3 / 60
+dt = 1e-4 / quality
+frame_duration = 2e-3
 p_vol, p_rho = (dx * 0.5)**2, 1
 p_mass = p_vol * p_rho
 Gf = 200 # Mode 1 fracture energy
-E, nu = 5e5, 0.2  # Young's modulus and Poisson's ratio
-sigma_f = 200 # principal failure stress. See Section 4.2 of paper.
+E, nu = 1e3, 0.2  # Young's modulus and Poisson's ratio
+sigma_f = 100 # principal failure stress. See Section 4.2 of paper.
 l_ch = dx * sqrt(2) # Characteristic length: grid-cell diagonal
 H_bar = sigma_f ** 2 / (2 * E * Gf)
 H = H_bar * l_ch / (1 - H_bar * l_ch)  # Brittleness factor.   See Section 4.2 of paper, under eq (7), for definition.
                                        #                       See Table 3 for actual parameter values.
-H = 40 # override "properly-calculated" brittleness factor :( because it didn't work very well.
+H = 0.1 # override "properly-calculated" brittleness factor :( because it didn't work very well.
        # TODO: Investigate these parameter settings. They might be scale dependent.
+
+
 print(f'H: {H}')
 mu_0, lambda_0 = E / (2 * (1 + nu)), E * nu / (
     (1 + nu) * (1 - 2 * nu))  # Lame parameters
