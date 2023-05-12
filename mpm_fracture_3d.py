@@ -15,11 +15,12 @@ ti.init(arch=arch)
 #dim, n_grid, steps, dt = 2, 128, 20, 2e-4
 #dim, n_grid, steps, dt = 2, 256, 32, 1e-4
 #dim, n_grid, steps, dt = 3, 32, 25, 4e-4
-dim, n_grid, steps, dt = 3, 64, 25, 2e-4 / 4
+dim, n_grid, steps, dt = 3, 64, 15, 2e-4 / 100
 # dim, n_grid, steps, dt = 3, 96, 1, 2e-4 / 10
 #dim, n_grid, steps, dt = 3, 128, 5, 1e-4
 
 n_particles = n_grid**dim // 2**(dim - 1)
+n_groups = 6
 
 print(f'n_particles: {n_particles}')
 
@@ -28,9 +29,9 @@ dx = 1 / n_grid
 p_rho = 1
 p_vol = (dx * 0.5)**2
 p_mass = p_vol * p_rho
-GRAVITY = [0, -9.8, 0]
+GRAVITY = [0, 0, 0]
 bound = 3
-E = 5e4  # Young's modulus
+E = 3e4  # Young's modulus
 nu = 0.2  #  Poisson's ratio
 Gf = 200 # Mode 1 fracture energy
 sigma_f = 150 # principal failure stress. See Section 4.2 of paper.
@@ -52,9 +53,11 @@ F_dg = ti.Matrix.field(dim, dim, dtype=float,
                        shape=n_particles)  # deformation gradient
 F_Jp = ti.field(float, n_particles)
 
+F_external_forces = ti.Vector.field(3, float, n_particles) # per-particle external force.
+
 F_colors = ti.Vector.field(4, float, n_particles)
 F_colors_random = ti.Vector.field(4, float, n_particles)
-F_materials = ti.field(int, n_particles)
+F_group_ids = ti.field(int, n_particles)
 F_grid_v = ti.Vector.field(dim, float, (n_grid, ) * dim)
 F_grid_m = ti.field(float, (n_grid, ) * dim)
 F_used = ti.field(int, n_particles)
@@ -62,9 +65,14 @@ colormap = matplotlib.cm.get_cmap('jet') # Can try other colormaps
 
 neighbour = (3, ) * dim
 
-WATER = 0
-JELLY = 1
-SNOW = 2
+[
+    WATER,
+    JELLY,
+    SNOW,
+    TOP_HANDLE,
+    BOTTOM_HANDLE,
+    BODY,
+] = list(range(n_groups))
 
 @ti.func
 def my_sym_eig_3x3(A):
@@ -147,6 +155,8 @@ def substep(g_x: float, g_y: float, g_z: float):
         fint_dt = - dt * p_vol * M_inv * stress_J # to be multiplied by weight and dpos, later. In other words,
                                                   # internal force * dt = fint_dt @ (xi - xp)
 
+        fext_dt = dt * get_external_force(p)
+
         for offset in ti.static(ti.grouped(ti.ndrange(*neighbour))):
             dpos = (offset - fx) * dx
             weight = 1.0
@@ -158,6 +168,7 @@ def substep(g_x: float, g_y: float, g_z: float):
             mv_contribution += F_C[p] @ dpos    # include affine velocity
             mv_contribution *= p_mass           # momentum = mass * velocity
             mv_contribution += fint_dt @ dpos   # include internal force * dt
+            mv_contribution += fext_dt          # include external force * dt
 
             # F_grid_v[base + offset] += weight * (p_mass * F_v[p] + affine @ dpos)
             F_grid_v[base + offset] += weight * mv_contribution
@@ -191,27 +202,41 @@ def substep(g_x: float, g_y: float, g_z: float):
         F_x[p] += dt * F_v[p]
         F_C[p] = new_C
 
+@ti.func
+def get_external_force(particle_id: int):
+    return F_external_forces[particle_id]
+    # group_id = F_group_ids[particle_id]
+    # if group_id < 0:
+    #     return ti.Vector.zero(dt=float, n=3)
+    # return F_external_forces[group_id]
+    
 
 class CubeVolume:
-    def __init__(self, minimum, size, material):
+    def __init__(self, minimum, size, initial_velocity, group_id):
         self.minimum = minimum
         self.size = size
         self.volume = self.size.x * self.size.y * self.size.z
-        self.material = material
+        self.initial_velocity = initial_velocity
+        self.group_id = group_id
 
 
 @ti.kernel
-def init_cube_vol(first_par: int, last_par: int, x_begin: float,
-                  y_begin: float, z_begin: float, x_size: float, y_size: float,
-                  z_size: float, material: int):
+def init_cube_vol(
+    first_par: int, last_par: int,
+    x_begin: float, y_begin: float, z_begin: float,
+    x_size: float, y_size: float, z_size: float,
+    x_v0: float, y_v0: float, z_v0: float,
+    group_id: int
+):
     for i in range(first_par, last_par):
         F_x[i] = ti.Vector([ti.random() for i in range(dim)]) * ti.Vector(
             [x_size, y_size, z_size]) + ti.Vector([x_begin, y_begin, z_begin])
         F_Jp[i] = 1
         F_dg[i] = ti.Matrix([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
-        F_v[i] = ti.Vector([0.0, -2.0, 0.0])
+        F_v[i] = ti.Vector([x_v0, y_v0, z_v0])
+        F_external_forces[i] = ti.Vector([0.0, 0.0, 0.0]) # TODO: Specify external forces? Do we need this if we can already specify initial velocities?
         F_damage[i] = 0
-        F_materials[i] = material
+        F_group_ids[i] = group_id
         F_colors_random[i] = ti.Vector(
             [ti.random(), ti.random(),
              ti.random(), ti.random()])
@@ -229,7 +254,6 @@ def set_all_unused():
         F_C[p] = ti.Matrix([[0, 0, 0], [0, 0, 0], [0, 0, 0]])
         F_v[p] = ti.Vector([0.0, 0.0, 0.0])
 
-
 def init_vols(vols):
     set_all_unused()
     total_vol = 0
@@ -245,45 +269,128 @@ def init_vols(vols):
                     vols
             ) - 1:  # this is the last volume, so use all remaining particles
                 par_count = n_particles - next_p
-            init_cube_vol(next_p, next_p + par_count, *v.minimum, *v.size,
-                          v.material)
+            init_cube_vol(
+                next_p, next_p + par_count,
+                *v.minimum,
+                *v.size,
+                *v.initial_velocity,
+                v.group_id)
             next_p += par_count
         else:
             raise Exception("???")
 
 
 @ti.kernel
-def set_color_by_material(mat_color: ti.types.ndarray()):
+def set_color_by_group(group_colors: ti.types.ndarray()):
     for i in range(n_particles):
-        mat = F_materials[i]
+        id = F_group_ids[i]
         F_colors[i] = ti.Vector(
-            [mat_color[mat, 0], mat_color[mat, 1], mat_color[mat, 2], 1.0])
+            [group_colors[id, 0], group_colors[id, 1], group_colors[id, 2], 1.0])
 
 
 print("Loading presets...this might take a minute")
 
-presets = [[
-    CubeVolume(ti.Vector([0.55, 0.05, 0.55]), ti.Vector([0.4, 0.4, 0.4]),
-               WATER),
-],
-           [
-               CubeVolume(ti.Vector([0.05, 0.05, 0.05]),
-                          ti.Vector([0.3, 0.4, 0.3]), WATER),
-               CubeVolume(ti.Vector([0.65, 0.05, 0.65]),
-                          ti.Vector([0.3, 0.4, 0.3]), WATER),
-           ],
-           [
-               CubeVolume(ti.Vector([0.6, 0.05, 0.6]),
-                          ti.Vector([0.25, 0.25, 0.25]), WATER),
-               CubeVolume(ti.Vector([0.35, 0.35, 0.35]),
-                          ti.Vector([0.25, 0.25, 0.25]), SNOW),
-               CubeVolume(ti.Vector([0.05, 0.6, 0.05]),
-                          ti.Vector([0.25, 0.25, 0.25]), JELLY),
-           ]]
+half_size = .30
+short_size = .27
+
+mode_speeds = [1.1, 1.1, 2.5]
+
+presets = [
+    [
+        CubeVolume(
+            minimum=ti.Vector([0.5 - half_size, 0.5 - half_size, 0.5]),
+            size=ti.Vector([2 * half_size, short_size, half_size]),
+            initial_velocity=ti.Vector([0.0, -mode_speeds[0], 0.0]),
+            group_id=BOTTOM_HANDLE
+        ),
+        CubeVolume(
+            minimum=ti.Vector([0.5 - half_size, 0.5 + half_size - short_size, 0.5]),
+            size=ti.Vector([2 * half_size, short_size, half_size]),
+            initial_velocity=ti.Vector([0.0, mode_speeds[0], 0.0]),
+            group_id=TOP_HANDLE
+        ),
+        CubeVolume(
+            minimum=ti.Vector([0.5 - half_size, 0.5 - half_size, 0.5 - half_size]),
+            size=ti.Vector([2 * half_size, 2 * half_size, half_size]),
+            initial_velocity=ti.Vector([0.0, 0.0, 0.0]),
+            group_id=BODY
+        ),
+    ],
+    [
+        CubeVolume(
+            minimum=ti.Vector([0.5 - half_size, 0.5 - half_size, 0.5]),
+            size=ti.Vector([2 * half_size, short_size, half_size]),
+            initial_velocity=ti.Vector([0.0, 0.0, mode_speeds[1]]),
+            group_id=BOTTOM_HANDLE
+        ),
+        CubeVolume(
+            minimum=ti.Vector([0.5 - half_size, 0.5 + half_size - short_size, 0.5]),
+            size=ti.Vector([2 * half_size, short_size, half_size]),
+            initial_velocity=ti.Vector([0.0, 0.0, -mode_speeds[1]]),
+            group_id=TOP_HANDLE
+        ),
+        CubeVolume(
+            minimum=ti.Vector([0.5 - half_size, 0.5 - half_size, 0.5 - half_size]),
+            size=ti.Vector([2 * half_size, 2 * half_size, half_size]),
+            initial_velocity=ti.Vector([0.0, 0.0, 0.0]),
+            group_id=BODY
+        ),
+    ],
+    [
+        CubeVolume(
+            minimum=ti.Vector([0.5 - half_size, 0.5 - half_size, 0.5]),
+            size=ti.Vector([2 * half_size, short_size, half_size]),
+            initial_velocity=ti.Vector([mode_speeds[2], 0.0, 0.0]),
+            group_id=BOTTOM_HANDLE
+        ),
+        CubeVolume(
+            minimum=ti.Vector([0.5 - half_size, 0.5 + half_size - short_size, 0.5]),
+            size=ti.Vector([2 * half_size, short_size, half_size]),
+            initial_velocity=ti.Vector([-mode_speeds[2], 0.0, 0.0]),
+            group_id=TOP_HANDLE
+        ),
+        CubeVolume(
+            minimum=ti.Vector([0.5 - half_size, 0.5 - half_size, 0.5 - half_size]),
+            size=ti.Vector([2 * half_size, 2 * half_size, half_size]),
+            initial_velocity=ti.Vector([0.0, 0.0, 0.0]),
+            group_id=BODY
+        ),
+    ],
+    [
+        CubeVolume(
+            minimum=ti.Vector([0.55, 0.05, 0.55]),
+            size=ti.Vector([0.4, 0.4, 0.4]),
+            initial_velocity=ti.Vector([0.0, 0.0, 0.0]),
+            group_id=WATER
+        ),
+    ],
+    [
+        CubeVolume(
+            minimum=ti.Vector([0.6, 0.05, 0.6]),
+            size=ti.Vector([0.25, 0.25, 0.25]),
+            initial_velocity=ti.Vector([0.0, 0.0, 0.0]),
+            group_id=WATER
+        ),
+        CubeVolume(
+            minimum=ti.Vector([0.35, 0.35, 0.35]),
+            size=ti.Vector([0.25, 0.25, 0.25]),
+            initial_velocity=ti.Vector([0.0, 0.0, 0.0]),
+            group_id=SNOW
+        ),
+        CubeVolume(
+            minimum=ti.Vector([0.05, 0.6, 0.05]),
+            size=ti.Vector([0.25, 0.25, 0.25]),
+            initial_velocity=ti.Vector([0.0, 0.0, 0.0]),
+            group_id=JELLY
+        ),
+    ],
+]
 preset_names = [
-    "Single Dam Break",
-    "Double Dam Break",
-    "Water Snow Jelly",
+    "Fracture mode I",
+    "Fracture mode II",
+    "Fracture mode III",
+    "Single cube",
+    "Three separate cubes",
 ]
 
 curr_preset_id = 0
@@ -291,35 +398,64 @@ curr_preset_id = 0
 paused = False
 
 use_random_colors = False
+show_damage = True
 particles_radius = 0.002
 
-material_colors = [(0.1, 0.6, 0.9), (0.93, 0.33, 0.23), (1.0, 1.0, 1.0)]
+group_colors = [
+    (0.1, 0.6, 0.9),
+    (0.93, 0.33, 0.23),
+    (1.0, 1.0, 1.0),
 
-
-def init():
-    global paused
-    init_vols(presets[curr_preset_id])
-
-
-init()
+    (0.93, 0.33, 0.33),
+    (0.33, 0.93, 0.33),
+    (0.33, 0.33, 0.93),
+]
+assert(len(group_colors) == n_groups)
 
 res = (1080, 720)
 window = ti.ui.Window("Real MPM 3D", res, vsync=True)
 
 canvas = window.get_canvas()
+canvas.set_background_color((1, 1, 1))
 gui = window.get_gui()
 scene = ti.ui.Scene()
 camera = ti.ui.Camera()
-camera.position(0.5, 1.0, 1.95)
-camera.lookat(0.5, 0.3, 0.5)
-camera.fov(55)
 
 
-def show_options():
+def init():
+    global paused
+    if curr_preset_id == 2:
+        camera.position(1.1, 1.3, 1.1)
+        camera.lookat(0.5, 0.5, 0.5)
+        camera.fov(55)
+    else:
+        camera.position(1.5, 0.6, 0.8)
+        camera.lookat(0.5, 0.5, 0.5)
+        camera.fov(55)
+    init_vols(presets[curr_preset_id])
+
+
+init()
+
+
+def handle_ui():
     global use_random_colors
+    global show_damage
     global paused
     global particles_radius
     global curr_preset_id
+    
+
+    for e in window.get_events(ti.ui.PRESS):
+        if e.key == ti.ui.SPACE:
+            # Toggle pause
+            paused = not paused
+        if e.key == 'c':
+            # Toggle pause
+            show_damage = not show_damage
+        if e.key == 'r':
+            init()
+
 
     with gui.sub_window("Presets", 0.05, 0.1, 0.2, 0.15) as w:
         old_preset = curr_preset_id
@@ -337,14 +473,15 @@ def show_options():
 
     with gui.sub_window("Options", 0.05, 0.45, 0.2, 0.4) as w:
         use_random_colors = w.checkbox("use_random_colors", use_random_colors)
+        show_damage = w.checkbox("show_damage (Press C to toggle)", show_damage)
         if not use_random_colors:
-            material_colors[WATER] = w.color_edit_3("water color",
-                                                    material_colors[WATER])
-            material_colors[SNOW] = w.color_edit_3("snow color",
-                                                   material_colors[SNOW])
-            material_colors[JELLY] = w.color_edit_3("jelly color",
-                                                    material_colors[JELLY])
-            set_color_by_material(np.array(material_colors, dtype=np.float32))
+            group_colors[WATER] = w.color_edit_3("water color",
+                                                    group_colors[WATER])
+            group_colors[SNOW] = w.color_edit_3("snow color",
+                                                   group_colors[SNOW])
+            group_colors[JELLY] = w.color_edit_3("jelly color",
+                                                    group_colors[JELLY])
+            set_color_by_group(np.array(group_colors, dtype=np.float32))
         particles_radius = w.slider_float("particles radius ",
                                           particles_radius, 0, 0.005)
         if w.button("restart"):
@@ -363,14 +500,15 @@ def render():
     camera.track_user_inputs(window, movement_speed=0.03, hold_key=ti.ui.RMB)
     scene.set_camera(camera)
 
-    scene.ambient_light((0, 0, 0))
+    scene.ambient_light((1, 1, 1))
 
-    damage_numpy = F_damage.to_numpy(float)
-    # damage_numpy[damage_numpy < 1] = 0 # Ignore partial damage. Only fully damaged particles are colored.
-    alpha = lerp(1, 0.1, damage_numpy)
-    color_numpy = colormap(damage_numpy)
-    color_numpy[:, 3] = alpha
-    F_colors.from_numpy(color_numpy)
+    if show_damage:
+        damage_numpy = F_damage.to_numpy(float)
+        # damage_numpy[damage_numpy < 1] = 0 # Ignore partial damage. Only fully damaged particles are colored.
+        alpha = lerp(0.2, 1, damage_numpy)
+        color_numpy = colormap(damage_numpy)
+        color_numpy[:, 3] = alpha
+        F_colors.from_numpy(color_numpy)
     colors_used = F_colors_random if use_random_colors else F_colors
     scene.particles(F_x, per_vertex_color=colors_used, radius=particles_radius)
 
@@ -393,7 +531,7 @@ def main():
                 substep(*GRAVITY)
 
         render()
-        show_options()
+        handle_ui()
         window.show()
 
 
