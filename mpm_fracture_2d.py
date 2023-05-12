@@ -9,22 +9,22 @@ ti.init(arch=arch)
 # ti.init(arch=ti.cuda, debug=True)
 # ti.init(arch=ti.cpu, debug=False)
 
-quality = 3  # Use a larger value for higher-res simulations
-n_particles, n_grid = 9000 * quality**2, 64 * quality
-# n_particles = 100
+quality = 2  # Use a larger value for higher-res simulations
+n_particles, n_grid = 9000 * quality ** 2, 64 * quality
+n_particles = 20000
 dx, inv_dx = 1 / n_grid, float(n_grid)
-dt = 1e-4 / quality / 60
-frame_duration = 2e-3 / 60
+dt = 1e-4 / quality
+frame_duration = 2e-3
 p_vol, p_rho = (dx * 0.5)**2, 1
 p_mass = p_vol * p_rho
 Gf = 200 # Mode 1 fracture energy
-E, nu = 5e5, 0.2  # Young's modulus and Poisson's ratio
+E, nu = 5e3, 0.2  # Young's modulus and Poisson's ratio
 sigma_f = 200 # principal failure stress. See Section 4.2 of paper.
 l_ch = dx * sqrt(2) # Characteristic length: grid-cell diagonal
 H_bar = sigma_f ** 2 / (2 * E * Gf)
 H = H_bar * l_ch / (1 - H_bar * l_ch)  # Brittleness factor.   See Section 4.2 of paper, under eq (7), for definition.
                                        #                       See Table 3 for actual parameter values.
-H = 40 # override "properly-calculated" brittleness factor :( because it didn't work very well.
+H = 15 # override "properly-calculated" brittleness factor :( because it didn't work very well.
        # TODO: Investigate these parameter settings. They might be scale dependent.
 print(f'H: {H}')
 mu_0, lambda_0 = E / (2 * (1 + nu)), E * nu / (
@@ -272,15 +272,29 @@ def reset():
     # group_size = n / 3
     # (i // group_size): [0, 0, ..., 0, 1, 1, ..., 1, 2, 2, ..., 2] == material
     start_pos = ti.Vector([0.2, 1e-8])
+    rect = [(0.2, 1e-8, 0.4, 0.4), (0.4, 1e-8, 0.6, 0.6), (0.6, 0.2, 0.8, 0.6)]
+    weight = [2/7, 3/7, 2/7]
     for i in range(n_particles):
-        group = i // ((n_particles+1) // 2)
-        x[i] = [
-            ti.random() * 0.4 + start_pos[0] + 0.2 * group,
-            ti.random() * 0.4 + start_pos[1] + 0.2 * group
-        ]
+        # group = i // ((n_particles+1) // 2)
+        random = ti.random()
+        if random <= 2/7 :
+            x[i] = [
+                ti.random() * (rect[0][2] - rect[0][0]) + rect[0][0],
+                ti.random() * (rect[0][3] - rect[0][1]) + rect[0][1]
+            ]
+        elif random <= 5/7:
+            x[i] = [
+                ti.random() * (rect[1][2] - rect[1][0]) + rect[1][0],
+                ti.random() * (rect[1][3] - rect[1][1]) + rect[1][1]
+            ]
+        else :
+            x[i] = [
+                ti.random() * (rect[2][2] - rect[2][0]) + rect[2][0],
+                ti.random() * (rect[2][3] - rect[2][1]) + rect[2][1]
+            ]
         g2p_report[i] = False
         p2g_report[i] = False
-        material[i] = i // group_size  # 0: fluid 1: jelly 2: snow
+        material[i] = 0  # 0: fluid 1: jelly 2: snow
         v[i] = [0, -0.5]
         F[i] = ti.Matrix([[1, 0], [0, 1]])
         damage[i] = 0
